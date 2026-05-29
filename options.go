@@ -103,6 +103,16 @@ func WithLog(log Logger) Option {
 	}
 }
 
+// WithMaxBytes sets the maximum memory in bytes that the cache can use.
+// When the limit is reached, entries with the oldest expiration times are evicted.
+// This requires the value type T to implement the Sizer interface.
+// Eviction will trigger when EITHER capacity OR maxBytes is exceeded.
+func WithMaxBytes(maxBytes uint64) Option {
+	return func(c *Config) {
+		c.maxBytes = maxBytes
+	}
+}
+
 // WithDistributedStorage allows you to use the cache with a distributed
 // key-value store. The "GetOrFetch" and "GetOrFetchBatch" functions will check
 // this store first and only proceed to the underlying data source if the key

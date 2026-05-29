@@ -15,27 +15,53 @@ type entry[T any] struct {
 	synchronousRefreshAt time.Time
 	numOfRefreshRetries  int
 	isMissingRecord      bool
+	// Memory footprint of this entry in bytes.
+	size uint32
 }
 
 // shard is a thread-safe data structure that holds a subset of the cache entries.
 type shard[T any] struct {
 	sync.RWMutex
 	*Config
-	capacity           int
+	capacity int
+	// capacityInBytes is the capacity of the shard in bytes. It is set to a value greater than 0 when
+	// cache configuration defines MaxBytes > 0.
+	capacityInBytes    uint64
 	ttl                time.Duration
 	entries            map[string]*entry[T]
 	evictionPercentage int
+	// Total memory currently in use by this shard in bytes.
+	currentBytes uint64
 }
 
 // newShard creates a new shard and returns a pointer to it.
-func newShard[T any](capacity int, ttl time.Duration, evictionPercentage int, cfg *Config) *shard[T] {
+func newShard[T any](capacity int, ttl time.Duration, evictionPercentage int, cfg *Config, capacityInBytes uint64) *shard[T] {
 	return &shard[T]{
 		Config:             cfg,
 		capacity:           capacity,
 		ttl:                ttl,
 		entries:            make(map[string]*entry[T]),
 		evictionPercentage: evictionPercentage,
+		currentBytes:       0,
+		capacityInBytes:    capacityInBytes,
 	}
+}
+
+// calculateEntrySize computes the memory footprint of a key-value pair.
+// If MaxBytes is configured, the value is expected to implement Sizer.
+func (s *shard[T]) calculateEntrySize(key string, value T) uint32 {
+	keySize := uint32(len(key))
+
+	var valueSize uint32
+	if s.capacityInBytes > 0 {
+		if sizer, ok := any(value).(Sizer); ok {
+			valueSize = sizer.Size()
+		}
+	}
+
+	// Add overhead for the entry struct and map entry.
+	// This is an approximation - Go's map entries have internal overhead.
+	return keySize + valueSize + 16
 }
 
 // size returns the number of entries in the shard.
@@ -53,6 +79,7 @@ func (s *shard[T]) evictExpired() {
 	var entriesEvicted int
 	for _, e := range s.entries {
 		if s.clock.Now().After(e.expiresAt) {
+			s.currentBytes -= uint64(e.size)
 			delete(s.entries, e.key)
 			entriesEvicted++
 		}
@@ -69,6 +96,7 @@ func (s *shard[T]) forceEvict() {
 	if s.evictionPercentage == 100 {
 		evictedCount := len(s.entries)
 		s.entries = make(map[string]*entry[T])
+		s.currentBytes = 0
 		s.reportEntriesEvicted(evictedCount)
 		return
 	}
@@ -89,12 +117,45 @@ func (s *shard[T]) forceEvict() {
 	for key, e := range s.entries {
 		// Here we're essentially saying: if e.expiresAt <= cutoff.
 		if !e.expiresAt.After(cutoff) {
+			s.currentBytes -= uint64(e.size)
 			delete(s.entries, key)
 			entriesEvicted++
 
 			if entriesEvicted == entriesToEvict {
 				break
 			}
+		}
+	}
+	s.reportEntriesEvicted(entriesEvicted)
+}
+
+// forceEvictBytes evicts entries until there's enough room for the new entry.
+// It evicts entries with the oldest expiration times first. Should be called with a lock.
+func (s *shard[T]) forceEvictBytes(newEntrySize uint32) {
+	s.reportForcedEviction()
+
+	// Evict entries with oldest expiration times until we have room for the new entry
+	entriesEvicted := 0
+	for s.currentBytes+uint64(newEntrySize) > s.capacityInBytes && len(s.entries) > 0 {
+		// Find the entry with the oldest expiration time
+		var oldestKey string
+		var oldestExpires time.Time
+		var oldestSize uint32
+		var found bool
+
+		for key, e := range s.entries {
+			if !found || e.expiresAt.Before(oldestExpires) {
+				oldestKey = key
+				oldestExpires = e.expiresAt
+				oldestSize = e.size
+				found = true
+			}
+		}
+
+		if found {
+			s.currentBytes -= uint64(oldestSize)
+			delete(s.entries, oldestKey)
+			entriesEvicted++
 		}
 	}
 	s.reportEntriesEvicted(entriesEvicted)
@@ -164,17 +225,28 @@ func (s *shard[T]) set(key string, value T, isMissingRecord bool) bool {
 	s.Lock()
 	defer s.Unlock()
 
-	// Check we need to perform an eviction first.
-	evict := len(s.entries) >= s.capacity
+	entrySize := s.calculateEntrySize(key, value)
 
-	// If the cache is configured to not evict any entries,
-	// and we're att full capacity, we'll return early.
-	if s.evictionPercentage < 1 && evict {
-		return false
-	}
+	// Check if we need to perform eviction based on capacity or bytes.
+	atCapacity := len(s.entries) >= s.capacity
+	overBytes := s.capacityInBytes > 0 && s.currentBytes+uint64(entrySize) > s.capacityInBytes
 
-	if evict {
+	// If we're over the bytes limit, we must evict (bytes eviction is independent of evictionPercentage)
+	if overBytes {
+		s.forceEvictBytes(entrySize)
+		// Fall through to create the entry after eviction
+	} else if atCapacity {
+		// If we're at capacity and eviction is enabled, evict based on capacity
+		// If the cache is configured to not evict any entries, return early.
+		if s.evictionPercentage < 1 {
+			return false
+		}
 		s.forceEvict()
+	} else {
+		// Check if there's an existing entry to update (subtract old size)
+		if existingEntry, exists := s.entries[key]; exists {
+			s.currentBytes -= uint64(existingEntry.size)
+		}
 	}
 
 	now := s.clock.Now()
@@ -183,6 +255,7 @@ func (s *shard[T]) set(key string, value T, isMissingRecord bool) bool {
 		value:           value,
 		expiresAt:       now.Add(s.ttl),
 		isMissingRecord: isMissingRecord,
+		size:            entrySize,
 	}
 
 	if s.earlyRefreshes {
@@ -198,14 +271,18 @@ func (s *shard[T]) set(key string, value T, isMissingRecord bool) bool {
 	}
 
 	s.entries[key] = newEntry
-	return evict
+	s.currentBytes += uint64(entrySize)
+	return atCapacity || overBytes
 }
 
 // delete removes a key from the shard.
 func (s *shard[T]) delete(key string) {
 	s.Lock()
 	defer s.Unlock()
-	delete(s.entries, key)
+	if entry, exists := s.entries[key]; exists {
+		s.currentBytes -= uint64(entry.size)
+		delete(s.entries, key)
+	}
 }
 
 // keys returns all non-expired keys in the shard.
