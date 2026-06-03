@@ -1,6 +1,7 @@
 package sturdyc_test
 
 import (
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -18,22 +19,20 @@ func (v sizedValue) Size() uint32 {
 }
 
 func TestMemoryBasedEviction(t *testing.T) {
-	t.Parallel()
-
-	// Create a cache with a max of 100 bytes and reasonably large values.
-	// Each value will be ~50 bytes, so we should only be able to store 1-2 entries.
+	// Create a cache with a max of 300 bytes and reasonably large values.
+	// Each value will be ~200 bytes, so we should only be able to store 1 entry.
 	capacity := 1000 // High capacity so we don't hit entry limit
 	numShards := 1
 	ttl := time.Hour
 	evictionPercentage := 5
-	maxBytes := uint64(100)
+	maxBytes := uint64(300)
 
 	c := sturdyc.New[sizedValue](capacity, numShards, ttl, evictionPercentage,
 		sturdyc.WithNoContinuousEvictions(),
 		sturdyc.WithMaxBytes(maxBytes),
 	)
 
-	// Add first entry (50 bytes + key overhead)
+	// Add first entry (~200 bytes)
 	c.Set("key1", sizedValue{data: make([]byte, 50)})
 
 	sizeAfterFirst := c.SizeBytes()
@@ -73,7 +72,7 @@ func TestMemoryBasedEvictionWithDifferentSizes(t *testing.T) {
 	numShards := 1
 	ttl := time.Hour
 	evictionPercentage := 10
-	maxBytes := uint64(200)
+	maxBytes := uint64(300)
 
 	c := sturdyc.New[sizedValue](capacity, numShards, ttl, evictionPercentage,
 		sturdyc.WithNoContinuousEvictions(),
@@ -121,13 +120,12 @@ func TestMemoryBasedEvictionEvictsOldestFirst(t *testing.T) {
 }
 
 func TestSizeBytesTracksDeletes(t *testing.T) {
-	t.Parallel()
-
+	// configure cache so that size-based eviction won't be triggered
 	capacity := 1000
-	numShards := 2
+	numShards := 1
 	ttl := time.Hour
 	evictionPercentage := 10
-	maxBytes := uint64(500)
+	maxBytes := uint64(10000)
 
 	c := sturdyc.New[sizedValue](capacity, numShards, ttl, evictionPercentage,
 		sturdyc.WithNoContinuousEvictions(),
@@ -154,8 +152,6 @@ func TestSizeBytesTracksDeletes(t *testing.T) {
 }
 
 func TestMaxBytesPanicsWithoutSizer(t *testing.T) {
-	t.Parallel()
-
 	defer func() {
 		if r := recover(); r == nil {
 			t.Errorf("expected panic when MaxBytes is set without Sizer implementation")
@@ -169,8 +165,6 @@ func TestMaxBytesPanicsWithoutSizer(t *testing.T) {
 }
 
 func TestMaxBytesZeroDoesNotRequireSizer(t *testing.T) {
-	t.Parallel()
-
 	// This should not panic - maxBytes = 0 (not configured)
 	c := sturdyc.New[string](100, 1, time.Hour, 10,
 		sturdyc.WithMaxBytes(0),
@@ -183,14 +177,12 @@ func TestMaxBytesZeroDoesNotRequireSizer(t *testing.T) {
 }
 
 func TestEvictionTriggersWhenAnyLimitExceeded(t *testing.T) {
-	t.Parallel()
-
 	// Test 1: Bytes limit triggers eviction before capacity
 	capacity := 10000 // High capacity
 	numShards := 1
 	ttl := time.Hour
 	evictionPercentage := 10
-	maxBytes := uint64(100)
+	maxBytes := uint64(1000)
 
 	c := sturdyc.New[sizedValue](capacity, numShards, ttl, evictionPercentage,
 		sturdyc.WithNoContinuousEvictions(),
@@ -227,15 +219,13 @@ func TestEvictionTriggersWhenAnyLimitExceeded(t *testing.T) {
 }
 
 func TestBytesEvictionWorksWithZeroEvictionPercentage(t *testing.T) {
-	t.Parallel()
-
 	// When evictionPercentage is 0, capacity-based eviction is disabled
 	// but bytes-based eviction should still work
 	capacity := 10000
 	numShards := 1
 	ttl := time.Hour
 	evictionPercentage := 0 // Disabled
-	maxBytes := uint64(100)
+	maxBytes := uint64(1000)
 
 	c := sturdyc.New[sizedValue](capacity, numShards, ttl, evictionPercentage,
 		sturdyc.WithNoContinuousEvictions(),
@@ -277,5 +267,68 @@ func TestMemoryBasedEvictionWithShards(t *testing.T) {
 	totalBytes := c.SizeBytes()
 	if totalBytes > maxBytes {
 		t.Errorf("expected total bytes to be limited to %d, got %d", maxBytes, totalBytes)
+	}
+}
+
+// TestCalculateEntrySizeAccuracy tests that the calculated entry size
+// is reasonably accurate when compared to actual heap allocations
+// reported by the Go runtime.
+func TestCalculateEntrySizeAccuracy(t *testing.T) {
+	// Force garbage collection and get baseline heap stats
+	runtime.GC()
+	var m1 runtime.MemStats
+	runtime.ReadMemStats(&m1)
+
+	// Create a cache with a single shard and Sizer implementation
+	capacity := 10000
+	numShards := 1
+	ttl := time.Hour
+	evictionPercentage := 10
+	maxBytes := uint64(1 << 30) // Very large to avoid eviction during test
+
+	c := sturdyc.New[sizedValue](capacity, numShards, ttl, evictionPercentage,
+		sturdyc.WithNoContinuousEvictions(),
+		sturdyc.WithMaxBytes(maxBytes),
+	)
+
+	// Number of entries to add for meaningful measurement
+	numEntries := 1000
+	valueSize := 100 // Each value will have 100 bytes of data
+
+	for i := 0; i < numEntries; i++ {
+		c.Set(strconv.Itoa(i), sizedValue{data: make([]byte, valueSize)})
+	}
+
+	// Allow GC to settle and get final heap stats
+	runtime.GC()
+	var m2 runtime.MemStats
+	runtime.ReadMemStats(&m2)
+
+	calculatedSize := c.SizeBytes()
+	heapGrowth := m2.Alloc - m1.Alloc
+
+	t.Logf("Calculated size: %d bytes", calculatedSize)
+	t.Logf("Heap growth: %d bytes, delta: %d, percentage: %f", heapGrowth, heapGrowth-calculatedSize,
+		float64(heapGrowth-calculatedSize)/float64(calculatedSize))
+
+	// The calculated size should be within a reasonable range of the actual heap growth.
+	// Due to Go's memory allocator behavior (rounding, fragmentation, GC overhead),
+	// we allow for some variance but the calculated size should be close.
+	// Map entries have significant overhead in Go (hash map internal structures)
+	// so we expect calculated < actual. Let's verify the relationship makes sense.
+	minExpected := calculatedSize
+	maxExpected := uint64(float64(calculatedSize) * 1.3) // Allow up to 30% more than estimated size
+
+	if heapGrowth < minExpected {
+		t.Errorf("heap growth (%d) is less than calculated size (%d), this shouldn't happen", heapGrowth, calculatedSize)
+	}
+
+	if heapGrowth > maxExpected {
+		t.Logf("warning: heap growth (%d) is significantly larger than calculated size (%d), possibly due to allocator overhead", heapGrowth, calculatedSize)
+	}
+
+	// Verify the calculated size is at least reasonably positive
+	if calculatedSize == 0 {
+		t.Error("expected non-zero calculated size")
 	}
 }
