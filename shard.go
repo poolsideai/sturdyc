@@ -9,9 +9,9 @@ import (
 
 const (
 	// cost of string header in bytes
-	stringHeaderBytes = uint32(unsafe.Sizeof(""))
+	_stringHeaderBytes = uint32(unsafe.Sizeof(""))
 	// entry type wrapper overhead
-	entryStructBytes = uint32(unsafe.Sizeof(entry[any]{}))
+	_entryStructBytes = uint32(unsafe.Sizeof(entry[any]{}))
 )
 
 // entry represents a single cache entry.
@@ -58,7 +58,7 @@ func newShard[T any](capacity int, ttl time.Duration, evictionPercentage int, cf
 // calculateEntrySize computes the memory footprint of a key-value pair.
 // If MaxBytes is configured, the value is expected to implement Sizer.
 func (s *shard[T]) calculateEntrySize(key string, value T) uint32 {
-	keySize := stringHeaderBytes + uint32(len(key))
+	keySize := _stringHeaderBytes + uint32(len(key))
 
 	var valueSize uint32
 	if sizer, ok := any(value).(Sizer); ok {
@@ -67,7 +67,7 @@ func (s *shard[T]) calculateEntrySize(key string, value T) uint32 {
 
 	// Add overhead for the entry struct and map entry.
 	// This is an approximation - Go's map entries have internal overhead.
-	return keySize + valueSize + 16 + entryStructBytes
+	return keySize + valueSize + 16 + _entryStructBytes
 }
 
 // size returns the number of entries in the shard.

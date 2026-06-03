@@ -3,6 +3,7 @@ package sturdyc_test
 import (
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,17 +37,13 @@ func TestMemoryBasedEviction(t *testing.T) {
 	c.Set("key1", sizedValue{data: make([]byte, 50)})
 
 	sizeAfterFirst := c.SizeBytes()
-	if sizeAfterFirst <= 0 {
-		t.Errorf("expected positive size after first entry, got %d", sizeAfterFirst)
-	}
+	assertThat(t, sizeAfterFirst > 0, "expected positive size after first entry, got %d", sizeAfterFirst)
 
 	// Add second entry - this should trigger bytes-based eviction
 	c.Set("key2", sizedValue{data: make([]byte, 50)})
 
 	sizeAfterSecond := c.SizeBytes()
-	if sizeAfterSecond > maxBytes {
-		t.Errorf("expected size <= %d after second entry, got %d", maxBytes, sizeAfterSecond)
-	}
+	assertThat(t, sizeAfterSecond <= maxBytes, "expected size <= %d after second entry, got %d", maxBytes, sizeAfterSecond)
 
 	// Add many more entries to verify eviction keeps working
 	for i := 3; i < 100; i++ {
@@ -54,15 +51,11 @@ func TestMemoryBasedEviction(t *testing.T) {
 	}
 
 	finalSize := c.SizeBytes()
-	if finalSize > maxBytes {
-		t.Errorf("expected size <= %d after many entries, got %d", maxBytes, finalSize)
-	}
+	assertThat(t, finalSize <= maxBytes, "expected size <= %d after many entries, got %d", maxBytes, finalSize)
 
 	// The cache should have evicted entries to stay under the limit
 	cacheSize := c.Size()
-	if cacheSize > 3 {
-		t.Errorf("expected cache to have evicted entries, got %d entries", cacheSize)
-	}
+	assertThat(t, cacheSize <= 3, "expected cache to have evicted entries, got %d entries", cacheSize)
 }
 
 func TestMemoryBasedEvictionWithDifferentSizes(t *testing.T) {
@@ -86,9 +79,7 @@ func TestMemoryBasedEvictionWithDifferentSizes(t *testing.T) {
 	c.Set("large2", sizedValue{data: make([]byte, 100)}) // ~116 bytes - should trigger eviction
 
 	finalSize := c.SizeBytes()
-	if finalSize > maxBytes {
-		t.Errorf("expected size <= %d, got %d", maxBytes, finalSize)
-	}
+	assertThat(t, finalSize <= maxBytes, "expected size <= %d, got %d", maxBytes, finalSize)
 }
 
 func TestMemoryBasedEvictionEvictsOldestFirst(t *testing.T) {
@@ -114,9 +105,8 @@ func TestMemoryBasedEvictionEvictsOldestFirst(t *testing.T) {
 	c.Set("large", sizedValue{data: make([]byte, 200)}) // ~216 bytes
 
 	// The "large" key should exist
-	if _, ok := c.Get("large"); !ok {
-		t.Error("expected 'large' key to exist")
-	}
+	_, ok := c.Get("large")
+	assertThat(t, ok, "expected 'large' key to exist")
 }
 
 func TestSizeBytesTracksDeletes(t *testing.T) {
@@ -137,31 +127,23 @@ func TestSizeBytesTracksDeletes(t *testing.T) {
 	c.Set("key2", sizedValue{data: make([]byte, 100)})
 
 	sizeBeforeDelete := c.SizeBytes()
-	if sizeBeforeDelete <= 0 {
-		t.Fatalf("expected positive size before delete, got %d", sizeBeforeDelete)
-	}
+	assertThat(t, sizeBeforeDelete > 0, "expected positive size before delete, got %d", sizeBeforeDelete)
 
 	// Delete one entry
 	c.Delete("key1")
 
 	sizeAfterDelete := c.SizeBytes()
 	// Size should have decreased
-	if sizeAfterDelete >= sizeBeforeDelete {
-		t.Errorf("expected size to decrease after delete, before=%d, after=%d", sizeBeforeDelete, sizeAfterDelete)
-	}
+	assertThat(t, sizeAfterDelete < sizeBeforeDelete, "expected size to decrease after delete, before=%d, after=%d", sizeBeforeDelete, sizeAfterDelete)
 }
 
 func TestMaxBytesPanicsWithoutSizer(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("expected panic when MaxBytes is set without Sizer implementation")
-		}
-	}()
-
-	// string does not implement Sizer
-	sturdyc.New[string](100, 1, time.Hour, 10,
-		sturdyc.WithMaxBytes(1000),
-	)
+	assertPanic(t, func() {
+		// string does not implement Sizer
+		sturdyc.New[string](100, 1, time.Hour, 10,
+			sturdyc.WithMaxBytes(1000),
+		)
+	}, "expected panic when MaxBytes is set without Sizer implementation")
 }
 
 func TestMaxBytesZeroDoesNotRequireSizer(t *testing.T) {
@@ -171,9 +153,7 @@ func TestMaxBytesZeroDoesNotRequireSizer(t *testing.T) {
 		sturdyc.WithNoContinuousEvictions(),
 	)
 
-	if c == nil {
-		t.Error("expected cache to be created without panic")
-	}
+	assertThat(t, c != nil, "expected cache to be created without panic")
 }
 
 func TestEvictionTriggersWhenAnyLimitExceeded(t *testing.T) {
@@ -195,9 +175,7 @@ func TestEvictionTriggersWhenAnyLimitExceeded(t *testing.T) {
 	}
 
 	// Should be limited by bytes, not capacity
-	if c.SizeBytes() > maxBytes {
-		t.Errorf("expected bytes to be limited to %d, got %d", maxBytes, c.SizeBytes())
-	}
+	assertThat(t, c.SizeBytes() <= maxBytes, "expected bytes to be limited to %d, got %d", maxBytes, c.SizeBytes())
 
 	// Test 2: Capacity limit triggers eviction before bytes
 	capacity = 10
@@ -213,9 +191,7 @@ func TestEvictionTriggersWhenAnyLimitExceeded(t *testing.T) {
 	}
 
 	// Should be limited by capacity
-	if c2.Size() > capacity {
-		t.Errorf("expected entries to be limited to %d, got %d", capacity, c2.Size())
-	}
+	assertThat(t, c2.Size() <= capacity, "expected entries to be limited to %d, got %d", capacity, c2.Size())
 }
 
 func TestBytesEvictionWorksWithZeroEvictionPercentage(t *testing.T) {
@@ -238,9 +214,7 @@ func TestBytesEvictionWorksWithZeroEvictionPercentage(t *testing.T) {
 	}
 
 	// Should be limited by bytes
-	if c.SizeBytes() > maxBytes {
-		t.Errorf("expected bytes to be limited to %d, got %d", maxBytes, c.SizeBytes())
-	}
+	assertThat(t, c.SizeBytes() <= maxBytes, "expected bytes to be limited to %d, got %d", maxBytes, c.SizeBytes())
 }
 
 func TestMemoryBasedEvictionWithShards(t *testing.T) {
@@ -265,9 +239,7 @@ func TestMemoryBasedEvictionWithShards(t *testing.T) {
 	// SizeBytes should correctly sum across all shards
 	// With 10 shards and maxBytes=10000, each shard gets ~1000 bytes
 	totalBytes := c.SizeBytes()
-	if totalBytes > maxBytes {
-		t.Errorf("expected total bytes to be limited to %d, got %d", maxBytes, totalBytes)
-	}
+	assertThat(t, totalBytes <= maxBytes, "expected total bytes to be limited to %d, got %d", maxBytes, totalBytes)
 }
 
 // TestCalculateEntrySizeAccuracy tests that the calculated entry size
@@ -308,27 +280,121 @@ func TestCalculateEntrySizeAccuracy(t *testing.T) {
 	heapGrowth := m2.Alloc - m1.Alloc
 
 	t.Logf("Calculated size: %d bytes", calculatedSize)
-	t.Logf("Heap growth: %d bytes, delta: %d, percentage: %f", heapGrowth, heapGrowth-calculatedSize,
-		float64(heapGrowth-calculatedSize)/float64(calculatedSize))
+	t.Logf("Heap growth: %d bytes, delta: %d, percentage: %.2f%%", heapGrowth, heapGrowth-calculatedSize,
+		float64(heapGrowth-calculatedSize)/float64(calculatedSize)*100)
 
 	// The calculated size should be within a reasonable range of the actual heap growth.
 	// Due to Go's memory allocator behavior (rounding, fragmentation, GC overhead),
 	// we allow for some variance but the calculated size should be close.
 	// Map entries have significant overhead in Go (hash map internal structures)
-	// so we expect calculated < actual. Let's verify the relationship makes sense.
+	// so we expect calculated < actual.
 	minExpected := calculatedSize
-	maxExpected := uint64(float64(calculatedSize) * 1.3) // Allow up to 30% more than estimated size
+	maxExpected := uint64(float64(calculatedSize) * 1.5) // Allow up to 50% more for map overhead
 
-	if heapGrowth < minExpected {
-		t.Errorf("heap growth (%d) is less than calculated size (%d), this shouldn't happen", heapGrowth, calculatedSize)
+	assertThat(t, heapGrowth >= minExpected, "heap growth (%d) is less than calculated size (%d)", heapGrowth, calculatedSize)
+	assertThat(t, heapGrowth <= maxExpected, "heap growth (%d) exceeds expected maximum (%d), possibly due to allocator overhead", heapGrowth, maxExpected)
+	assertThat(t, calculatedSize > 0, "expected non-zero calculated size")
+}
+
+// TestCalculateEntrySizeMultipleEntries verifies that the size calculation
+// scales correctly with multiple entries.
+func TestCalculateEntrySizeMultipleEntries(t *testing.T) {
+	t.Parallel()
+
+	c := sturdyc.New[testSizerValue](10000, 1, time.Hour, 10,
+		sturdyc.WithNoContinuousEvictions(),
+		sturdyc.WithMaxBytes(1<<30),
+	)
+
+	numEntries := 100
+	valueSize := uint32(50)
+
+	for i := 0; i < numEntries; i++ {
+		c.Set(strconv.Itoa(i), testSizerValue{data: make([]byte, valueSize)})
 	}
 
-	if heapGrowth > maxExpected {
-		t.Logf("warning: heap growth (%d) is significantly larger than calculated size (%d), possibly due to allocator overhead", heapGrowth, calculatedSize)
+	actualSize := c.SizeBytes()
+
+	// Each entry contributes at least valueSize bytes
+	minSize := uint64(numEntries) * uint64(valueSize)
+	assertThat(t, actualSize >= minSize, "size %d is less than minimum expected %d", actualSize, minSize)
+
+	// Each entry contributes at most valueSize + overhead
+	maxSize := uint64(numEntries) * (uint64(valueSize) + 200)
+	assertThat(t, actualSize <= uint64(maxSize), "size %d exceeds maximum expected %d", actualSize, maxSize)
+
+	t.Logf("Size for %d entries with %d byte values: %d bytes", numEntries, valueSize, actualSize)
+}
+
+// TestCalculateEntrySizeFormula verifies that the size calculation
+// produces correct values for known inputs.
+func TestCalculateEntrySizeFormula(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		keyLen    int
+		valueSize uint32
+	}{
+		{name: "small_key_small_value", keyLen: 5, valueSize: 10},
+		{name: "medium_key_medium_value", keyLen: 20, valueSize: 100},
+		{name: "large_key_large_value", keyLen: 100, valueSize: 1000},
 	}
 
-	// Verify the calculated size is at least reasonably positive
-	if calculatedSize == 0 {
-		t.Error("expected non-zero calculated size")
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			c := sturdyc.New[testSizerValue](1000, 1, time.Hour, 10,
+				sturdyc.WithNoContinuousEvictions(),
+				sturdyc.WithMaxBytes(1<<30),
+			)
+
+			key := strings.Repeat("x", tt.keyLen)
+			value := testSizerValue{data: make([]byte, tt.valueSize)}
+			c.Set(key, value)
+
+			actualSize := c.SizeBytes()
+
+			// Verify size is positive
+			assertThat(t, actualSize > 0, "expected positive size, got %d", actualSize)
+
+			// Verify size is within expected bounds:
+			// Should be at least valueSize + keyLen + minimal overhead
+			minSize := tt.valueSize + uint32(tt.keyLen)
+			assertThat(t, actualSize >= uint64(minSize), "size %d is less than minimum expected %d", actualSize, minSize)
+
+			// Should be at most valueSize + keyLen + substantial overhead
+			maxSize := tt.valueSize + uint32(tt.keyLen) + 200
+			assertThat(t, actualSize <= uint64(maxSize), "size %d exceeds maximum expected %d", actualSize, maxSize)
+		})
 	}
+}
+
+type testSizerValue struct {
+	data []byte
+}
+
+func (v testSizerValue) Size() uint32 {
+	return uint32(len(v.data))
+}
+
+// assertThat is a helper function that reports an error if the condition is false.
+func assertThat(t *testing.T, cond bool, msg string, args ...any) {
+	t.Helper()
+	if !cond {
+		t.Errorf(msg, args...)
+	}
+}
+
+// assertPanic tests that a function panics as expected.
+func assertPanic(t *testing.T, fn func(), msg string) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Errorf(msg)
+		}
+	}()
+	fn()
 }
