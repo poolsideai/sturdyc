@@ -2,7 +2,9 @@ package sturdyc
 
 import (
 	"math/rand/v2"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -25,6 +27,10 @@ type entry[T any] struct {
 	isMissingRecord      bool
 	// Memory footprint of this entry in bytes.
 	size uint32
+	// SIEVE eviction fields.
+	visited atomic.Bool
+	prev    *entry[T]
+	next    *entry[T]
 }
 
 // shard is a thread-safe data structure that holds a subset of the cache entries.
@@ -40,6 +46,10 @@ type shard[T any] struct {
 	evictionPercentage int
 	// Total memory currently in use by this shard in bytes.
 	currentBytes uint64
+	// SIEVE eviction: doubly-linked list and hand pointer.
+	head *entry[T]
+	tail *entry[T]
+	hand *entry[T]
 }
 
 // newShard creates a new shard and returns a pointer to it.
@@ -77,6 +87,40 @@ func (s *shard[T]) size() int {
 	return len(s.entries)
 }
 
+// pushFront inserts an entry at the head of the SIEVE linked list.
+// Should be called with a write lock held.
+func (s *shard[T]) pushFront(e *entry[T]) {
+	e.prev = nil
+	e.next = s.head
+	if s.head != nil {
+		s.head.prev = e
+	}
+	s.head = e
+	if s.tail == nil {
+		s.tail = e
+	}
+}
+
+// unlink removes an entry from the SIEVE linked list.
+// Should be called with a write lock held.
+func (s *shard[T]) unlink(e *entry[T]) {
+	if s.hand == e {
+		s.hand = e.prev
+	}
+	if e.prev != nil {
+		e.prev.next = e.next
+	} else {
+		s.head = e.next
+	}
+	if e.next != nil {
+		e.next.prev = e.prev
+	} else {
+		s.tail = e.prev
+	}
+	e.prev = nil
+	e.next = nil
+}
+
 // evictExpired evicts all the expired entries in the shard.
 func (s *shard[T]) evictExpired() {
 	s.Lock()
@@ -86,6 +130,9 @@ func (s *shard[T]) evictExpired() {
 	for _, e := range s.entries {
 		if s.clock.Now().After(e.expiresAt) {
 			s.currentBytes -= uint64(e.size)
+			if s.useSIEVE {
+				s.unlink(e)
+			}
 			delete(s.entries, e.key)
 			entriesEvicted++
 		}
@@ -93,8 +140,36 @@ func (s *shard[T]) evictExpired() {
 	s.reportEntriesEvicted(entriesEvicted)
 }
 
-// forceEvict evicts a certain percentage of the entries in the shard
-// based on the expiration time. Should be called with a lock.
+// sieveEvict runs the SIEVE eviction algorithm, evicting entries until
+// shouldStop returns true or the shard is empty. Returns the number of
+// entries evicted. Should be called with a lock.
+func (s *shard[T]) sieveEvict(shouldStop func() bool) int {
+	entriesEvicted := 0
+	for !shouldStop() && len(s.entries) > 0 {
+		if s.hand == nil {
+			s.hand = s.tail
+		}
+		if s.hand == nil {
+			break
+		}
+		if s.hand.visited.Load() {
+			s.hand.visited.Store(false)
+			s.hand = s.hand.prev
+		} else {
+			victim := s.hand
+			s.hand = s.hand.prev
+			s.unlink(victim)
+			s.currentBytes -= uint64(victim.size)
+			delete(s.entries, victim.key)
+			entriesEvicted++
+		}
+	}
+	return entriesEvicted
+}
+
+// forceEvict evicts a certain percentage of the entries in the shard.
+// Uses SIEVE when enabled, otherwise falls back to TTL-based eviction.
+// Should be called with a lock.
 func (s *shard[T]) forceEvict() {
 	s.reportForcedEviction()
 
@@ -103,10 +178,24 @@ func (s *shard[T]) forceEvict() {
 		evictedCount := len(s.entries)
 		s.entries = make(map[string]*entry[T])
 		s.currentBytes = 0
+		s.head = nil
+		s.tail = nil
+		s.hand = nil
 		s.reportEntriesEvicted(evictedCount)
 		return
 	}
 
+	if s.useSIEVE {
+		entriesToEvict := int(float64(len(s.entries)) * float64(s.evictionPercentage) / 100)
+		sizeBefore := len(s.entries)
+		s.sieveEvict(func() bool {
+			return sizeBefore-len(s.entries) >= entriesToEvict
+		})
+		s.reportEntriesEvicted(sizeBefore - len(s.entries))
+		return
+	}
+
+	// TTL-based eviction: evict entries with the oldest expiration times.
 	expirationTimes := make([]time.Time, 0, len(s.entries))
 	for _, e := range s.entries {
 		expirationTimes = append(expirationTimes, e.expiresAt)
@@ -136,33 +225,40 @@ func (s *shard[T]) forceEvict() {
 }
 
 // forceEvictBytes evicts entries until there's enough room for the new entry.
-// It evicts entries with the oldest expiration times first. Should be called with a lock.
+// Uses SIEVE when enabled, otherwise falls back to TTL-based eviction.
+// Should be called with a lock.
 func (s *shard[T]) forceEvictBytes(newEntrySize uint32) {
 	s.reportForcedEviction()
 
-	// Evict entries with oldest expiration times until we have room for the new entry
+	if s.useSIEVE {
+		n := s.sieveEvict(func() bool {
+			return s.currentBytes+uint64(newEntrySize) <= s.capacityInBytes
+		})
+		s.reportEntriesEvicted(n)
+		return
+	}
+
+	// TTL-based eviction: sort entries by expiration and evict oldest first.
+	type candidate struct {
+		key  string
+		exp  time.Time
+		size uint32
+	}
+	candidates := make([]candidate, 0, len(s.entries))
+	for key, e := range s.entries {
+		candidates = append(candidates, candidate{key, e.expiresAt, e.size})
+	}
+	slices.SortFunc(candidates, func(a, b candidate) int {
+		return a.exp.Compare(b.exp)
+	})
 	entriesEvicted := 0
-	for s.currentBytes+uint64(newEntrySize) > s.capacityInBytes && len(s.entries) > 0 {
-		// Find the entry with the oldest expiration time
-		var oldestKey string
-		var oldestExpires time.Time
-		var oldestSize uint32
-		var found bool
-
-		for key, e := range s.entries {
-			if !found || e.expiresAt.Before(oldestExpires) {
-				oldestKey = key
-				oldestExpires = e.expiresAt
-				oldestSize = e.size
-				found = true
-			}
+	for _, c := range candidates {
+		if s.currentBytes+uint64(newEntrySize) <= s.capacityInBytes {
+			break
 		}
-
-		if found {
-			s.currentBytes -= uint64(oldestSize)
-			delete(s.entries, oldestKey)
-			entriesEvicted++
-		}
+		s.currentBytes -= uint64(c.size)
+		delete(s.entries, c.key)
+		entriesEvicted++
 	}
 	s.reportEntriesEvicted(entriesEvicted)
 }
@@ -190,6 +286,11 @@ func (s *shard[T]) get(key string) (val T, exists, markedAsMissing, backgroundRe
 	if s.clock.Now().After(item.expiresAt) {
 		s.RUnlock()
 		return val, false, false, false, false
+	}
+
+	// Mark the entry as visited for SIEVE eviction.
+	if s.useSIEVE {
+		item.visited.Store(true)
 	}
 
 	// Check if the record should be synchronously refreshed.
@@ -237,22 +338,25 @@ func (s *shard[T]) set(key string, value T, isMissingRecord bool) bool {
 	atCapacity := len(s.entries) >= s.capacity
 	overBytes := s.capacityInBytes > 0 && s.currentBytes+uint64(entrySize) > s.capacityInBytes
 
+	// Check for an existing entry before eviction.
+	existingEntry, isUpdate := s.entries[key]
+
 	// If we're over the bytes limit, we must evict (bytes eviction is independent of evictionPercentage)
 	if overBytes {
 		s.forceEvictBytes(entrySize)
 		// Fall through to create the entry after eviction
-	} else if atCapacity {
-		// If we're at capacity and eviction is enabled, evict based on capacity
+	} else if atCapacity && !isUpdate {
+		// If we're at capacity and eviction is enabled, evict based on capacity.
+		// Updates don't increase entry count, so they don't need capacity eviction.
 		// If the cache is configured to not evict any entries, return early.
 		if s.evictionPercentage < 1 {
 			return false
 		}
 		s.forceEvict()
-	} else {
-		// Check if there's an existing entry to update (subtract old size)
-		if existingEntry, exists := s.entries[key]; exists {
-			s.currentBytes -= uint64(existingEntry.size)
-		}
+	}
+
+	if isUpdate {
+		s.currentBytes -= uint64(existingEntry.size)
 	}
 
 	now := s.clock.Now()
@@ -276,6 +380,30 @@ func (s *shard[T]) set(key string, value T, isMissingRecord bool) bool {
 		newEntry.numOfRefreshRetries = 0
 	}
 
+	if s.useSIEVE {
+		if isUpdate {
+			// For updates, replace the entry in its current list position to preserve SIEVE ordering.
+			newEntry.prev = existingEntry.prev
+			newEntry.next = existingEntry.next
+			if existingEntry.prev != nil {
+				existingEntry.prev.next = newEntry
+			} else {
+				s.head = newEntry
+			}
+			if existingEntry.next != nil {
+				existingEntry.next.prev = newEntry
+			} else {
+				s.tail = newEntry
+			}
+			if s.hand == existingEntry {
+				s.hand = newEntry
+			}
+		} else {
+			// New entries are inserted at the head of the list.
+			s.pushFront(newEntry)
+		}
+	}
+
 	s.entries[key] = newEntry
 	s.currentBytes += uint64(entrySize)
 	return atCapacity || overBytes
@@ -287,6 +415,9 @@ func (s *shard[T]) delete(key string) {
 	defer s.Unlock()
 	if entry, exists := s.entries[key]; exists {
 		s.currentBytes -= uint64(entry.size)
+		if s.useSIEVE {
+			s.unlink(entry)
+		}
 		delete(s.entries, key)
 	}
 }

@@ -50,6 +50,9 @@ type Config struct {
 	distributedStorage              DistributedStorageWithDeletions
 	distributedEarlyRefreshes       bool
 	distributedRefreshAfterDuration time.Duration
+
+	// Use SIEVE eviction algorithm (https://cachemon.github.io/SIEVE-website/)
+	useSIEVE bool
 }
 
 // Client represents a cache client that can be used to store and retrieve values.
