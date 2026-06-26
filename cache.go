@@ -45,6 +45,7 @@ type Config struct {
 	useRelativeTimeKeyFormat bool
 	keyTruncation            time.Duration
 	getSize                  func() int
+	getSizeBytes             func() uint64
 	maxBytes                 uint64 // Maximum bytes the cache can use across all shards.
 
 	distributedStorage              DistributedStorageWithDeletions
@@ -84,6 +85,7 @@ func New[T any](capacity, numShards int, ttl time.Duration, evictionPercentage i
 		clock:            NewClock(),
 		evictionInterval: ttl / time.Duration(numShards),
 		getSize:          client.Size,
+		getSizeBytes:     client.SizeBytes,
 		log:              slog.Default(),
 	}
 	// Apply the options to the configuration.

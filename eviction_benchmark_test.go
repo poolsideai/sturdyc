@@ -246,4 +246,7 @@ func (r *recorder) CacheBatchRefreshSize(_ int) {
 func (r *recorder) ObserveCacheSize(_ func() int) {
 }
 
+func (r *recorder) ObserveCacheSizeBytes(_ func() uint64) {
+}
+
 var _ sturdyc.MetricsRecorder = (*recorder)(nil)
