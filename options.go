@@ -8,6 +8,7 @@ type Option func(*Config)
 func WithMetrics(recorder MetricsRecorder) Option {
 	return func(c *Config) {
 		recorder.ObserveCacheSize(c.getSize)
+		recorder.ObserveCacheSizeBytes(c.getSizeBytes)
 		c.metricsRecorder = &distributedMetricsRecorder{recorder}
 	}
 }
@@ -103,6 +104,31 @@ func WithLog(log Logger) Option {
 	}
 }
 
+// WithMaxBytes sets the maximum memory in bytes that the cache can use.
+// When the limit is reached, entries with the oldest expiration times are evicted.
+// This requires the value type T to implement the Sizer interface.
+// Eviction will trigger when EITHER capacity OR maxBytes is exceeded.
+func WithMaxBytes(maxBytes uint64) Option {
+	return func(c *Config) {
+		c.maxBytes = maxBytes
+	}
+}
+
+// WithSIEVE enables the SIEVE eviction algorithm, which adapts to access
+// patterns by retaining frequently used entries. Without this option, the
+// cache uses TTL-based eviction where entries with the oldest expiration
+// times are evicted first.
+// SIEVE achieves >10pp better efficiency with the typical web-cache access pattern
+// (compared to the default TTL-based eviction) and identical (<0.5pp delta) efficiency for scan-resistant
+// and temporal shift access patterns. Apart from better efficiency, the eviction algorithm
+// itself is much more efficient: TTL-based eviction is O(N) or O(NlogN) (in case of size-based eviction),
+// while SIEVE eviction is amortized O(1).
+func WithSIEVE() Option {
+	return func(c *Config) {
+		c.useSIEVE = true
+	}
+}
+
 // WithDistributedStorage allows you to use the cache with a distributed
 // key-value store. The "GetOrFetch" and "GetOrFetchBatch" functions will check
 // this store first and only proceed to the underlying data source if the key
@@ -144,6 +170,7 @@ func WithDistributedStorageEarlyRefreshes(storage DistributedStorageWithDeletion
 func WithDistributedMetrics(metricsRecorder DistributedMetricsRecorder) Option {
 	return func(c *Config) {
 		metricsRecorder.ObserveCacheSize(c.getSize)
+		metricsRecorder.ObserveCacheSizeBytes(c.getSizeBytes)
 		c.metricsRecorder = metricsRecorder
 	}
 }

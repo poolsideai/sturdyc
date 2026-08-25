@@ -45,10 +45,15 @@ type Config struct {
 	useRelativeTimeKeyFormat bool
 	keyTruncation            time.Duration
 	getSize                  func() int
+	getSizeBytes             func() uint64
+	maxBytes                 uint64 // Maximum bytes the cache can use across all shards.
 
 	distributedStorage              DistributedStorageWithDeletions
 	distributedEarlyRefreshes       bool
 	distributedRefreshAfterDuration time.Duration
+
+	// Use SIEVE eviction algorithm (https://cachemon.github.io/SIEVE-website/)
+	useSIEVE bool
 }
 
 // Client represents a cache client that can be used to store and retrieve values.
@@ -80,6 +85,7 @@ func New[T any](capacity, numShards int, ttl time.Duration, evictionPercentage i
 		clock:            NewClock(),
 		evictionInterval: ttl / time.Duration(numShards),
 		getSize:          client.Size,
+		getSizeBytes:     client.SizeBytes,
 		log:              slog.Default(),
 	}
 	// Apply the options to the configuration.
@@ -87,12 +93,25 @@ func New[T any](capacity, numShards int, ttl time.Duration, evictionPercentage i
 	for _, opt := range opts {
 		opt(cfg)
 	}
+
+	// Validate that T implements Sizer if MaxBytes is configured.
+	if cfg.maxBytes > 0 {
+		var t T
+		if _, implementsSizer := any(t).(Sizer); !implementsSizer {
+			panic("maxBytes requires the value type to implement sturdyc.Sizer")
+		}
+	}
+
 	validateConfig(capacity, numShards, ttl, evictionPercentage, cfg)
 
 	shardSize := capacity / numShards
+	var shardMaxBytes uint64
+	if cfg.maxBytes > 0 {
+		shardMaxBytes = cfg.maxBytes / uint64(numShards)
+	}
 	shards := make([]*shard[T], numShards)
 	for i := 0; i < numShards; i++ {
-		shards[i] = newShard[T](shardSize, ttl, evictionPercentage, cfg)
+		shards[i] = newShard[T](shardSize, ttl, evictionPercentage, cfg, shardMaxBytes)
 	}
 	client.shards = shards
 	client.nextShard = 0
@@ -282,6 +301,22 @@ func (c *Client[T]) Size() int {
 	var sum int
 	for _, shard := range c.shards {
 		sum += shard.size()
+	}
+	return sum
+}
+
+// SizeBytes returns the total memory used by the cache in bytes.
+// This is only meaningful when MaxBytes is configured and the value type implements Sizer.
+//
+// Returns:
+//
+//	An integer representing the total memory used by the cache in bytes.
+func (c *Client[T]) SizeBytes() uint64 {
+	var sum uint64
+	for _, shard := range c.shards {
+		shard.RLock()
+		sum += shard.currentBytes
+		shard.RUnlock()
 	}
 	return sum
 }

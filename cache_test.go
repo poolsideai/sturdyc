@@ -455,3 +455,57 @@ func TestReportsMetricsForHitsAndMisses(t *testing.T) {
 		t.Errorf("expected 1 cache miss, got %d", metricsRecorder.cacheMisses)
 	}
 }
+
+func TestReportsCacheSizeBytes(t *testing.T) {
+	t.Parallel()
+
+	metricsRecorder := newTestMetricsRecorder(1)
+	capacity := 1000
+	numShards := 1
+	maxBytes := uint64(10000)
+
+	// Create a cache with MaxBytes configured and a Sizer implementation.
+	client := sturdyc.New[sizedValue](capacity, numShards, time.Hour, 10,
+		sturdyc.WithMetrics(metricsRecorder),
+		sturdyc.WithMaxBytes(maxBytes),
+		sturdyc.WithNoContinuousEvictions(),
+	)
+
+	// Verify the callback was registered.
+	metricsRecorder.Lock()
+	callback := metricsRecorder.sizeBytesCallback
+	metricsRecorder.Unlock()
+
+	if callback == nil {
+		t.Error("expected sizeBytesCallback to be registered")
+		return
+	}
+
+	// Initially, the cache is empty, so the callback should return 0.
+	initialSize := callback()
+	if initialSize != 0 {
+		t.Errorf("expected initial size to be 0, got %d", initialSize)
+	}
+
+	// Add entries with known sizes.
+	valueSize := 100
+	for i := 0; i < 10; i++ {
+		client.Set(strconv.Itoa(i), sizedValue{data: make([]byte, valueSize)})
+	}
+
+	// The callback should now return the current size.
+	currentSize := callback()
+
+	// Each entry should have at least valueSize bytes, plus some overhead.
+	// We expect the observed size to be at least valueSize * numEntries.
+	minExpectedSize := uint64(valueSize * 10)
+	if currentSize < minExpectedSize {
+		t.Errorf("expected size to be at least %d, got %d", minExpectedSize, currentSize)
+	}
+
+	// Verify it matches the client's SizeBytes.
+	clientSize := client.SizeBytes()
+	if currentSize != clientSize {
+		t.Errorf("expected size %d to match client size %d", currentSize, clientSize)
+	}
+}
